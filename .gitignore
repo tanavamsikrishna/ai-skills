@@ -1,0 +1,10 @@
+*.skill
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+.env
+.python-version
