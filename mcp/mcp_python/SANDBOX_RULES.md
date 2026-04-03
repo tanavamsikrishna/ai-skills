@@ -30,5 +30,5 @@ Append a comment to the rule using the following format:
 ## How it Works
 1. **Refresh on Call:** The `.sandbox-rules` file is read and parsed every time the `execute_python` tool is invoked.
 2. **Validation:** The tool checks the current system time against any `; EXPIRES:` metadata found in the file.
-3. **Safety:** If a timestamp is malformed, the rule is kept (to prevent accidental lockouts), but it is treated as a standard comment by the macOS `sandbox-exec` system.
+3. **Strict Validation:** If an `EXPIRES:` timestamp is malformed or invalid (not valid ISO 8601), the tool will raise an explicit error to prevent accidental bypassing of expiration dates.
 4. **Statelessness:** Since the rules are appended to the profile dynamically, you can modify `.sandbox-rules` at any time to change the permissions of the next execution.

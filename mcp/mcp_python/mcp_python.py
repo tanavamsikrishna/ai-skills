@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # dependencies = [
-#   "fastmcp","pandas"
+#   "fastmcp", "numpy", "polars", "scipy", "openpyxl", "pyyaml", "tomli", "requests"
 # ]
 # ///
 
@@ -28,14 +28,17 @@ def _get_sandbox_profile(cwd: str) -> str:
             with open(sandbox_rules_path, "r") as f:
                 now = datetime.now()
                 for line in f:
-                    match = re.search(r";\s*EXPIRES:\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", line)
+                    match = re.search(r";\s*EXPIRES:\s*([^ ]*)", line)
                     if match:
+                        date_str = match.group(1).strip()
                         try:
-                            expiry = datetime.fromisoformat(match.group(1))
+                            expiry = datetime.fromisoformat(date_str)
                             if expiry < now:
                                 continue
                         except ValueError:
-                            pass
+                            raise ValueError(
+                                f"Invalid EXPIRES format: '{date_str}'. Expected ISO 8601 (YYYY-MM-DDTHH:MM:SS)."
+                            )
                     extra_rules_list.append(line.strip())
         except Exception as e:
             # Re-raise to be caught by the tool
@@ -71,6 +74,8 @@ def execute_python(
     DO: Delegate entire complex tasks to a single, intelligent script. Write end-to-end programs that handle their own intermediate logic, data, and imports, and then use print() to output the final result.
     DO NOT: Use this as a line-by-line interactive shell. Do not make multiple back-and-forth tool calls to calculate intermediate steps.
     CRITICAL: The environment is STRICTLY STATELESS. Every execution starts entirely fresh. You must consolidate all variables, imports, and logic into one single tool call.
+
+    Available libraries: numpy, polars, scipy, openpyxl, pyyaml, tomli, requests
     """
 
     try:
@@ -89,8 +94,6 @@ def execute_python(
 
     except subprocess.TimeoutExpired:
         return "Error: Execution timed out after 10 seconds. Check for infinite loops."
-    except Exception as e:
-        return f"System Execution Error: {str(e)}"
 
 
 if __name__ == "__main__":
