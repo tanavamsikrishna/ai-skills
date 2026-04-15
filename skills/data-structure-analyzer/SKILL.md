@@ -1,5 +1,5 @@
 ---
-name: data-structure-analyzer
+name: Data Structure Analyzer
 description: Extracts the structure of JSON, JSONL, YAML, TOML, and JSON5 files by listing all the unique path.to.the.keys. Use this to safely understand the schema of a data file without reading its entire contents into your context window, which is crucial for large files.
 ---
 
