@@ -9,9 +9,9 @@
 # ///
 """Page-task PDF-to-EPUB helper.
 
-This script deliberately does not try to understand PDF content. It only splits
-and renders pages, creates page-level tasks for image-capable agents, and
-packages completed Markdown into EPUB.
+This script deliberately does not try to understand PDF content. It splits and
+renders pages, creates page-level tasks for agents, runs cheap extraction
+preflight when available, and packages completed Markdown into EPUB.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from lxml import etree
 
 XHTML_NS = "http://www.w3.org/1999/xhtml"
 PANDOC_MARKDOWN_FORMAT = "markdown+raw_html+pipe_tables+footnotes+tex_math_dollars"
+POPPLER_TIMEOUT_SECONDS = 120
 
 
 def fail(message: str) -> None:
@@ -77,6 +78,184 @@ def save_single_page_pdf(doc: fitz.Document, page_index: int, output: Path) -> N
     single.close()
 
 
+def run_preflight_tool(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
+    executable = command[0]
+    if not shutil.which(executable):
+        return {"available": False, "status": "missing", "command": command}
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=POPPLER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "available": True,
+            "status": "timeout",
+            "command": command,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+        }
+    return {
+        "available": True,
+        "status": "ok" if result.returncode == 0 else "error",
+        "returncode": result.returncode,
+        "command": command,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def split_pdftotext_pages(layout_text: str, page_count: int) -> list[str]:
+    parts = layout_text.split("\f")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if len(parts) < page_count:
+        parts.extend([""] * (page_count - len(parts)))
+    return parts[:page_count]
+
+
+def extracted_html_assets(preflight_dir: Path) -> dict[int, list[str]]:
+    assets_by_page: dict[int, list[str]] = {}
+    html_dir = preflight_dir / "pdftohtml"
+    for asset in sorted(html_dir.glob("*")):
+        if not asset.is_file() or asset.suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif"}:
+            continue
+        match = re.search(r"-(\d+)_\d+\.(?:png|jpe?g|gif)$", asset.name, re.IGNORECASE)
+        if not match:
+            continue
+        page_number = int(match.group(1))
+        assets_by_page.setdefault(page_number, []).append(str(asset.relative_to(preflight_dir)))
+    return assets_by_page
+
+
+def parse_pdfimages_list(output: str, preflight_dir: Path) -> dict[int, list[dict[str, Any]]]:
+    images_by_page: dict[int, list[dict[str, Any]]] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        page_number = int(fields[0])
+        entry: dict[str, Any] = {"num": int(fields[1]), "type": fields[2]}
+        if len(fields) > 4 and fields[3].isdigit() and fields[4].isdigit():
+            entry["width"] = int(fields[3])
+            entry["height"] = int(fields[4])
+        images_by_page.setdefault(page_number, []).append(entry)
+
+    extracted_dir = preflight_dir / "pdfimages" / "extracted"
+    for asset in sorted(extracted_dir.glob("*")):
+        if not asset.is_file():
+            continue
+        match = re.search(r"-(\d+)-\d+\.", asset.name)
+        if not match:
+            continue
+        page_number = int(match.group(1))
+        images_by_page.setdefault(page_number, []).append({"file": str(asset.relative_to(preflight_dir))})
+    return images_by_page
+
+
+def page_hints(text: str, html_assets: list[str], pdf_images: list[dict[str, Any]]) -> list[str]:
+    hints: list[str] = []
+    stripped = text.strip()
+    if stripped:
+        hints.append("has_text")
+    if len(stripped) < 200:
+        hints.append("low_text")
+    if html_assets:
+        hints.append("has_html_images")
+    if pdf_images:
+        hints.append("has_pdf_images")
+    formula_patterns = [r"\bwhere\b", r"\bequation\b", r"[=√∑∫]", r"\b(log|ln)\b"]
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in formula_patterns):
+        hints.append("formula_candidate")
+    table_patterns = [r"\btable\b", r"\t", r" {3,}\S+ {3,}\S+"]
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in table_patterns):
+        hints.append("table_candidate")
+    return hints
+
+
+def run_preflight(workdir: Path) -> dict[str, Any]:
+    manifest_path = workdir / "work" / "manifest.json"
+    if not manifest_path.exists():
+        fail(f"Missing manifest: {manifest_path}")
+    manifest = read_json(manifest_path)
+    pdf_path = Path(manifest["source_pdf"]).expanduser().resolve()
+    if not pdf_path.exists():
+        copied = workdir / manifest.get("copied_pdf", "")
+        if copied.exists():
+            pdf_path = copied.resolve()
+        else:
+            fail(f"PDF not found: {pdf_path}")
+
+    preflight_dir = workdir / "work" / "preflight"
+    if preflight_dir.exists():
+        shutil.rmtree(preflight_dir)
+    ensure_dir(preflight_dir)
+
+    report: dict[str, Any] = {
+        "source_pdf": str(pdf_path),
+        "workdir": str(workdir),
+        "tools": {},
+        "pages": [],
+    }
+
+    text_dir = preflight_dir / "pdftotext"
+    ensure_dir(text_dir)
+    layout_path = text_dir / "layout.txt"
+    text_result = run_preflight_tool(["pdftotext", "-layout", str(pdf_path), str(layout_path)])
+    report["tools"]["pdftotext"] = {key: text_result[key] for key in ("available", "status", "returncode", "command", "stderr") if key in text_result}
+
+    page_texts = [""] * int(manifest["page_count"])
+    if layout_path.exists():
+        page_texts = split_pdftotext_pages(layout_path.read_text(encoding="utf-8", errors="replace"), int(manifest["page_count"]))
+    for page in manifest["pages"]:
+        page_number = int(page["page"])
+        page_dir = Path(page["dir"])
+        ensure_dir(page_dir)
+        text = page_texts[page_number - 1] if page_number <= len(page_texts) else ""
+        (page_dir / "extracted.txt").write_text(text, encoding="utf-8")
+
+    html_dir = preflight_dir / "pdftohtml"
+    ensure_dir(html_dir)
+    html_root = html_dir / "html"
+    html_result = run_preflight_tool(["pdftohtml", "-q", "-s", "-noframes", "-enc", "UTF-8", "-fmt", "png", str(pdf_path), str(html_root)])
+    report["tools"]["pdftohtml"] = {key: html_result[key] for key in ("available", "status", "returncode", "command", "stderr") if key in html_result}
+    html_assets_by_page = extracted_html_assets(preflight_dir)
+
+    pdfimages_dir = preflight_dir / "pdfimages"
+    extracted_dir = pdfimages_dir / "extracted"
+    ensure_dir(extracted_dir)
+    list_result = run_preflight_tool(["pdfimages", "-list", str(pdf_path)])
+    report["tools"]["pdfimages_list"] = {key: list_result[key] for key in ("available", "status", "returncode", "command", "stderr") if key in list_result}
+    list_path = pdfimages_dir / "images-list.txt"
+    list_path.write_text(list_result.get("stdout", ""), encoding="utf-8")
+    extract_result = run_preflight_tool(["pdfimages", "-all", "-p", str(pdf_path), str(extracted_dir / "image")])
+    report["tools"]["pdfimages_extract"] = {key: extract_result[key] for key in ("available", "status", "returncode", "command", "stderr") if key in extract_result}
+    pdfimages_by_page = parse_pdfimages_list(list_result.get("stdout", ""), preflight_dir)
+
+    for page in manifest["pages"]:
+        page_number = int(page["page"])
+        text = page_texts[page_number - 1] if page_number <= len(page_texts) else ""
+        html_assets = html_assets_by_page.get(page_number, [])
+        pdf_images = pdfimages_by_page.get(page_number, [])
+        report["pages"].append(
+            {
+                "page": page_number,
+                "extracted_text": str(Path(page["dir"]) / "extracted.txt"),
+                "text_chars": len(text.strip()),
+                "html_images": html_assets,
+                "pdfimages": pdf_images,
+                "hints": page_hints(text, html_assets, pdf_images),
+            }
+        )
+
+    write_json(preflight_dir / "preflight_report.json", report)
+    return report
+
+
 def task_prompt(title: str, page_number: int, page_count: int) -> str:
     return f"""# Page {page_number} of {page_count}: {title}
 
@@ -84,9 +263,11 @@ Convert this single PDF page into Markdown.
 
 ## Inputs
 
-- `page.png`: primary visual source. Use image reading; do not depend on PDF text extraction.
+- `extracted.txt`: cheap text extraction draft when present. Use it for prose if reading order and content are sound.
+- `page.png`: primary visual source for formulas, tables, figure boundaries, and visual fidelity checks.
 - `page.pdf`: original single-page PDF for optional inspection.
 - `page.json`: page dimensions and source metadata.
+- `../../work/preflight/preflight_report.json`: optional extraction/asset diagnostics when preflight was run.
 
 ## Output
 
@@ -97,6 +278,7 @@ Write `page.md` in this same directory.
 - Preserve all visible content from this page.
 - Merge PDF line wraps into natural Markdown paragraphs.
 - Use Markdown headings/lists/tables where appropriate.
+- Prefer `extracted.txt` for ordinary prose. Do not inspect or send the full page image when extracted text/assets are sufficient.
 - Reconstruct formulas from the page image, not from extracted text.
 - Use Pandoc-compatible LaTeX math for formulas:
   - Inline formulas: `$...$`
@@ -106,7 +288,7 @@ Write `page.md` in this same directory.
 - If a formula cannot be reconstructed confidently, add a `<!-- REVIEW: ... -->` note. Do not invent formula structure.
 - Preserve tables. Wide Markdown tables are acceptable; HTML tables are acceptable when Markdown tables are too limiting.
 - Preserve figure captions.
-- For figures that must remain visual, place or create a cropped image in this page directory and reference it from `page.md`, for example `![Figure 1](figure-1.png)`.
+- For figures that must remain visual, first use clean extracted assets from preflight when available; otherwise place or create a cropped image in this page directory and reference it from `page.md`, for example `![Figure 1](figure-1.png)`.
 - Do not include full-page screenshots in `page.md`.
 - Keep source traceability by starting the file with:
 
@@ -170,12 +352,47 @@ def prepare(args: argparse.Namespace) -> None:
         "page_count": doc.page_count,
         "pages": page_records,
         "commands": {
+            "preflight": command_for("preflight", workdir),
             "build": command_for("build", workdir),
             "verify": command_for("verify", workdir),
         },
     }
     write_json(work_dir / "manifest.json", manifest)
-    print(json.dumps({"workdir": str(workdir), "pages": doc.page_count, "next": str(work_dir / "manifest.json")}, indent=2))
+    preflight_summary = None
+    if not args.no_preflight:
+        preflight_report = run_preflight(workdir)
+        preflight_summary = {
+            "report": str(workdir / "work" / "preflight" / "preflight_report.json"),
+            "tools": {name: data.get("status") for name, data in preflight_report.get("tools", {}).items()},
+        }
+    print(
+        json.dumps(
+            {
+                "workdir": str(workdir),
+                "pages": doc.page_count,
+                "next": str(work_dir / "manifest.json"),
+                "preflight": preflight_summary,
+            },
+            indent=2,
+        )
+    )
+
+
+def preflight(args: argparse.Namespace) -> None:
+    workdir = Path(args.workdir).expanduser().resolve()
+    report = run_preflight(workdir)
+    print(
+        json.dumps(
+            {
+                "workdir": str(workdir),
+                "report": str(workdir / "work" / "preflight" / "preflight_report.json"),
+                "tools": {name: data.get("status") for name, data in report.get("tools", {}).items()},
+                "pages": len(report.get("pages", [])),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def normalize_raw_html_voids(markdown: str) -> str:
@@ -501,6 +718,7 @@ def verify(args: argparse.Namespace) -> None:
     checks.append({"markdown_files": len(markdown_files)})
     checks.append({"empty_pages": empty_pages})
     checks.append({"review_note_pages": sorted(set(review_notes))})
+    checks.append({"preflight_report": (workdir / "work" / "preflight" / "preflight_report.json").exists()})
 
     if args.epub:
         epub_path = Path(args.epub).expanduser().resolve()
@@ -533,7 +751,12 @@ def make_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--title")
     prepare_parser.add_argument("--page-dpi", type=int, default=170)
     prepare_parser.add_argument("--overwrite", action="store_true")
+    prepare_parser.add_argument("--no-preflight", action="store_true", help="Skip cheap pdftotext/pdftohtml/pdfimages extraction")
     prepare_parser.set_defaults(func=prepare)
+
+    preflight_parser = sub.add_parser("preflight", help="Run cheap extraction diagnostics for an existing workdir")
+    preflight_parser.add_argument("--workdir", required=True)
+    preflight_parser.set_defaults(func=preflight)
 
     build_parser = sub.add_parser("build", help="Package completed page Markdown files into EPUB")
     build_parser.add_argument("--workdir", required=True)
