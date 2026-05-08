@@ -1,122 +1,86 @@
 ---
 name: pdf-paper-to-epub
-description: Convert technical, scientific, academic, or research PDF papers into high-fidelity EPUB files with preflight extraction, page tasks, focused visual reconstruction, and EPUB packaging. Use when the ai agent needs to coordinate token-efficient PDF-to-Markdown conversion with formulas as LaTeX math, figures/assets preserved, then package the completed Markdown into EPUB.
+description: Convert MinerU parser output for technical, scientific, academic, or research papers into EPUB files. Use when Codex needs to turn MinerU output directories containing *_content_list_v2.json, Markdown, and extracted images into an EPUB while preserving formulas, tables, figures, captions, footnotes, and producing formula audit artifacts without rereading the source PDF.
 ---
 
 # PDF Paper to EPUB
 
-## Overview
-
-Use this skill to convert scholarly PDFs into EPUBs through preflight-driven page reconstruction. The helper script splits and renders pages, runs cheap extraction diagnostics when available, creates page tasks, and packages completed Markdown; it does not understand PDF content semantically.
+Convert MinerU output into an EPUB without rereading the PDF. Treat `*_content_list_v2.json` as the primary source because it separates inline formulas, display formulas, tables, figures, and captions.
 
 ## Workflow
 
-1. Prepare page tasks and cheap preflight outputs:
+1. Locate the MinerU output directory. It is usually the `hybrid_auto` directory containing:
 
-Resolve the helper script from this skill directory, then run it with `uv`. For example, if this skill is installed at `/path/to/pdf-paper-to-epub`, set:
+- `*_content_list_v2.json`
+- `*.md`
+- `images/`
 
-```bash
-HELPER="/path/to/pdf-paper-to-epub/scripts/pdf_paper_to_epub.py"
-```
-
-```bash
-uv run "$HELPER" prepare input.pdf --workdir build/input
-```
-
-This creates one directory per page under `pages/page-XXX/` and, by default, runs non-fatal preflight extraction with `pdftotext`, `pdftohtml`, and `pdfimages` when those tools are installed. Use `--no-preflight` only when the extra extraction is unwanted or unavailable.
-
-Preflight writes:
-
-- `pages/page-XXX/extracted.txt`: page-local text extraction draft.
-- `work/preflight/preflight_report.json`: per-page diagnostics and extracted asset lists.
-- `work/preflight/pdftohtml/`: HTML and extracted assets from `pdftohtml`.
-- `work/preflight/pdfimages/`: image list and extracted embedded image objects.
-
-Rerun preflight after `prepare` if needed:
+2. Inspect the parsed structure before converting:
 
 ```bash
-uv run "$HELPER" preflight --workdir build/input
+uv run /path/to/pdf-paper-to-epub/scripts/mineru_to_epub.py inspect /path/to/hybrid_auto
 ```
 
-2. Review preflight and classify pages before spending vision tokens:
-
-- Use `extracted.txt` for ordinary prose when reading order is sound.
-- Use clean `pdftohtml` or `pdfimages` assets directly for figures when they preserve the visual content.
-- Transcribe image-like text blocks into real Markdown text when that improves reflow and accessibility.
-- Use `page.png`, `page.pdf`, or focused crops for formulas, tables, unclear figure boundaries, and pages where extraction is broken.
-- Do not inspect or send full page images when extracted text/assets are sufficient.
-
-Read `references/preflight-driven-conversion.md` before converting large papers or papers with many figures.
-
-3. Process pages with lightweight subagents when the user has requested or allowed subagent work:
-
-- Assign each worker a small page range, for example 3-8 pages depending on page complexity.
-- Tell each worker they are not alone in the workspace and must edit only their assigned `pages/page-XXX/page.md` files.
-- Give each worker the page directory paths and this task: read `task.md`, prefer `extracted.txt` for prose, inspect `page.png` or focused crops only where needed, optionally inspect `page.pdf`, and write faithful Markdown to `page.md`.
-- Require formulas to be reconstructed from the page image as Pandoc-compatible LaTeX math, not copied from PDF text extraction.
-- Require uncertain formulas/tables to be marked with `<!-- REVIEW: ... -->`.
-
-4. Build the EPUB after all page Markdown files are complete:
+3. Convert to EPUB:
 
 ```bash
-uv run "$HELPER" build --workdir build/input -o output.epub
+uv run /path/to/pdf-paper-to-epub/scripts/mineru_to_epub.py convert /path/to/hybrid_auto --output paper.epub
 ```
 
-`build` writes separate EPUB source files under `epub_src/` and unpacks the packaged EPUB into `epub_unpacked/` for debugging.
-If `--title` is not provided, `build` uses the first Markdown heading from `pages/page-001/page.md` as the EPUB title before falling back to the PDF metadata title from the manifest.
+The script uses LaTeX as the source math syntax and asks Pandoc to emit EPUB3 MathML because EPUB readers do not reliably render raw LaTeX. Raw LaTeX is preserved in `book.md` and the audit.
 
-5. Verify:
+This writes a build bundle, by default under `build/<paper-stem>/`, containing:
+
+- `book.md`: Markdown generated from MinerU v2 JSON.
+- `styles.css`: EPUB styling passed to Pandoc.
+- `assets/`: copied figures and table fallback images referenced by the EPUB.
+- `formula_images/`: copied display-equation crops for traceability.
+- `audit/formula_audit.json`: formula counts, source locations, image paths, and warnings.
+- `audit/formula_review.md`: human-readable list of suspicious formulas.
+- `audit/formula_repair_tasks.md`: created when Pandoc cannot parse a formula.
+- `audit/formula_repairs.template.json`: repair template created with formula IDs.
+
+If `convert` stops with Pandoc formula failures, repair them as a second pass:
+
+1. Open `audit/formula_repair_tasks.md`.
+2. Compare each formula against its copied formula image when available.
+3. Write corrected LaTeX into `formula_repairs.json` using the same IDs as the template.
+4. Rebuild with repairs:
 
 ```bash
-uv run "$HELPER" verify --workdir build/input --epub output.epub
+uv run /path/to/pdf-paper-to-epub/scripts/mineru_to_epub.py apply-repairs /path/to/hybrid_auto --repairs build/<paper-stem>/audit/formula_repairs.json --output paper.epub
 ```
 
-Repair empty pages, review notes, malformed XHTML, or missing content before calling the EPUB finished.
+4. Verify the final EPUB:
 
-## Page Task Contract
+```bash
+uv run /path/to/pdf-paper-to-epub/scripts/mineru_to_epub.py verify /path/to/hybrid_auto --epub paper.epub
+```
 
-Each `pages/page-XXX/` directory contains:
+Resolve any high-risk formula warnings before calling the EPUB finished.
 
-- `page.png`: primary visual source for the image-capable agent.
-- `page.pdf`: exact one-page PDF source.
-- `extracted.txt`: cheap text extraction draft, when preflight ran.
-- `page.json`: page metadata and dimensions.
-- `task.md`: page-specific conversion instructions.
-- `page.md`: the worker-owned Markdown output file.
+## Conversion Rules
 
-The worker must:
+- Do not run OCR or parse the source PDF again unless the user explicitly asks.
+- Use `*_content_list_v2.json` as canonical. Use MinerU Markdown and `*_content_list.json` only as fallback or diagnostic context.
+- Render inline formula fragments as `$...$` and display formulas as `$$...$$`.
+- Preserve MinerU LaTeX exactly unless an agent-reviewed repair file supplies a replacement for a formula ID.
+- Do not apply automatic formula compatibility rewrites. The script detects Pandoc formula parse failures and emits repair tasks instead.
+- Copy display formula image crops into `formula_images/` and include their paths in the audit report.
+- Flag risky formulas instead of silently fixing them.
+- Prefer MinerU table HTML when present. Copy table images for traceability; use the image as a fallback only when HTML is missing.
+- Use extracted figure/chart images for visual content. Do not use full PDF page screenshots.
+- Skip repetitive `page_number` and `page_footer` blocks by default. Preserve `page_footnote` and `page_aside_text` near their source position.
 
-- Preserve all visible content from that page.
-- Merge PDF line wraps into natural Markdown paragraphs.
-- Use extraction outputs first when they are faithful enough.
-- Use Markdown headings, lists, and tables when appropriate.
-- Use Pandoc-compatible LaTeX math for formulas by default: inline `$...$`, display `$$...$$`.
-- Do not define custom LaTeX macros.
-- If standard LaTeX cannot represent a formula faithfully, add a `<!-- REVIEW: formula ... -->` note explaining the difficulty.
-- For visual figures, use clean extracted assets first; otherwise create or place a cropped image in the same page directory and reference it from Markdown, for example `![Figure 1](figure-1.png)`.
-- Preserve tables, captions, footnotes, references, and figure information.
-- Avoid full-page screenshots in `page.md`.
+## Formula Review
 
-## Formula Policy
+Check `audit/formula_review.md` after conversion. Warnings usually mean the formula needs visual review against the copied crop image or original MinerU output. Common warnings include:
 
-- Formulas must be reconstructed visually from `page.png` or `page.pdf`.
-- Use Pandoc-compatible LaTeX math for formulas when the structure is clear.
-- Do not use text-preserving TeX generated from extracted PDF text as a substitute for formula reconstruction.
-- If a formula cannot be reconstructed confidently, add `<!-- REVIEW: formula ... -->` with the reason.
+- missing display-equation image crop
+- empty math content
+- unbalanced braces
+- replacement/unknown characters
+- digit-separated OCR artifacts such as `5 0 0`
+- Pandoc math conversion warnings
 
-Read `references/formula-reconstruction.md` before processing pages with significant formulas.
-
-## Debugging Outputs
-
-- `epub_src/pages/page-XXX.xhtml`: generated XHTML for each page before EPUB packaging.
-- `epub_src/assets/page-XXX/`: page-local images referenced by Markdown, such as cropped figures.
-- `epub_unpacked/`: unpacked final EPUB ZIP structure.
-- `work/manifest.json`: page list and build/verify commands.
-- `work/preflight/preflight_report.json`: extraction diagnostics and page hints.
-- `work/verification_report.json`: latest verification result.
-
-## References
-
-- Read `references/formula-reconstruction.md` when reconstructing equations.
-- Read `references/preflight-driven-conversion.md` before using extraction outputs or extracted assets.
-- Read `references/fidelity-checklist.md` before final verification.
+When uncertain, prefer adding a review note or using the copied formula crop as a visual reference rather than inventing a formula.
