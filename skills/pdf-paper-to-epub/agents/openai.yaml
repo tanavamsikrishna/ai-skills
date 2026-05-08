@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF Paper to EPUB"
+  short_description: "Convert technical PDFs into faithful EPUBs"
+  default_prompt: "Use $pdf-paper-to-epub to convert this scientific PDF into a high-fidelity EPUB."
